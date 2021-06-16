@@ -1,0 +1,592 @@
+---
+title: "SLICED Season 01 EP 03"
+author: "Michael Mullarkey"
+date: "6/15/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+require(knitr)
+knitr::opts_chunk$set(echo = TRUE, tidy = TRUE, warning = FALSE, message = FALSE, include = FALSE)
+```
+
+We did it! We made submissions that were accepted by Kaggle! Were they good? Who's to say?
+
+I had a bunch of fun, hope y'all did too. Excited to see how this shakes out...
+
+Ok y'all, LFG
+
+Which of these are numeric vs. factors vs. fake numeric actually factors? Let's find out...
+
+id, self-explanatory (or if not this is going to be a REALLY long 2 hours)
+
+factors/nominal:
+
+ship_mode, segment, city, state, postal_code, region, category, subcategory
+
+numeric:
+
+sales, quantity, discount, profit (outcome)
+
+dropping immediately:
+
+country, doesn't vary, though I'll get rid of that in the recipe
+
+Here's the plan:
+
+1. Panic
+2. Squiggly lines (Hi Mallory!)
+3. Make sure the data gets read in in the proper formats, and those formats are the same in train/test
+4. Get a sense of how big the data is, missingness patterns etc.
+5. Get a sense of how outcome is distributed (Want to do any corrections to the outcome before recipes)
+6. Panic a little again
+7. Visualize correlations between predictors/between predictors and outcome
+8. Make a minimum viable model via workflows
+9. Work on some more advanced feature engineering/model tuning
+10. Hunt for golden features while that happens
+
+```{r packages except for the ones i forget}
+
+library(tidyverse)
+library(tidymodels)
+library(skimr)
+library(naniar)
+library(tictoc)
+library(janitor)
+library(doMC)
+
+```
+
+```{r read in the data}
+
+d <- read_csv("train.csv") %>% 
+  clean_names() %>% 
+  mutate(across(
+    where(is.character),
+    as.factor
+  ),
+  postal_code = as.factor(postal_code),
+  discount = as.factor(discount))
+
+test <- read_csv("test.csv") %>% 
+  clean_names() %>% 
+  mutate(across(
+    where(is.character),
+    as.factor
+  ),
+  postal_code = as.factor(postal_code),
+  discount = as.factor(discount))
+
+compare_df_cols_same(d, test) # Phew, data is read in and in the right formats across train and test
+
+```
+
+```{r}
+
+glimpse(d)
+
+skim(d)
+
+```
+```{r visualizing data frame composition and missingness}
+
+library(visdat)
+
+vis_dat(d)
+
+vis_miss(d) # Wait, for real?? No missing data!! That seems... unlikely but ok? Will have to check to make sure nothing ridiculous happened later but I'm going with it for now
+
+```
+
+```{r looking at correlations among numeric predictors and outcome with an interactive heatmap}
+
+# Baiscally, am I thinking dimension reduction or not (Probably not with this few features but we'll see)
+
+d_cor <- d %>% 
+  dplyr::select(where(is.numeric), -id) %>% 
+  cor()
+
+library(heatmaply)
+
+heatmaply::heatmaply_cor(d_cor)
+
+```
+Ok, so unsurprisingly sales is pretty strongly correlated with profit all by itself, quantity less so, with discount mildly negatively correlated.
+
+```{r distribution of the outcome}
+
+d %>% 
+  ggplot(aes(x = profit)) +
+  geom_histogram(alpha = 0.5) +
+  labs(title = "WTF")
+
+```
+```{r}
+
+skim(d)
+
+```
+Ok, so profit has some absolutely massive outliers in both the positive and the negative direction. We'll want to at least try to account for that in the modeling process, though I'll have to think about how best to do that
+
+```{r actually hold on first and lets see if there are secret missing values in here}
+
+# Alright, looks like I'm just paranoid about that, and there's actually no missing data
+
+factor_vars <- d %>% 
+  dplyr::select(where(is.factor)) %>% 
+  names()
+
+map(factor_vars, ~{
+  
+  d %>% 
+    count(.data[[.x]])
+  
+})
+
+```
+
+```{r ok screw it lets go into a basic model see how terrible it is then go from there}
+
+## Recipe time!
+
+xg_rec <- recipe(profit ~ ., data = d) %>% 
+  update_role(id, new_role = "id") %>% 
+  step_rm(country) %>% 
+  step_novel(all_nominal_predictors()) %>% 
+  step_other(all_nominal_predictors()) %>% 
+  step_nzv(all_predictors()) %>% 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>% # Zip code might blow this up, we'll see
+  step_YeoJohnson(all_predictors()) %>% 
+  step_normalize(all_predictors())
+
+## Testing to make sure this basic recipe doesn't blow up before i start even modeling
+
+library(tictoc) 
+tic()
+xg_rec %>% 
+  prep(verbose = TRUE) %>% 
+  juice()
+toc()
+
+```
+
+```{r putting together workflow}
+
+xg_mod <- boost_tree() %>% 
+  set_engine("xgboost") %>% 
+  set_mode("regression")
+
+xg_wf <- workflow() %>% 
+  add_model(xg_mod) %>% 
+  add_recipe(xg_rec)
+
+# Let's create the CV folds
+
+set.seed(33) ## Larry Bird is my Dad's favorite basketball player, hi Dad!
+store_folds <- vfold_cv(d, v = 10, repeats = 5)
+
+# Ok, let's run this as a job to keep the console free
+
+write_rds(store_folds, "store_folds.rds")
+write_rds(xg_wf, "xg_wf.rds")
+
+library(rstudioapi)
+
+jobRunScript("mvm_job.R", name = "xg_mvm", exportEnv = "R_GlobalEnv")
+
+```
+
+I can't decide if this is good (jk, ok, since it's on the metric of $ and we know we have huge outliers) or terrible (because WOW that rmse looks large compared to previous weeks)
+
+```{r collecting cv metrics for basic model}
+
+xg_rs %>% 
+  collect_metrics()
+
+```
+```{r whatever lets fit this model make some predictions and make sure we can get on the Kaggle board}
+
+fitted_mvm <- fit(xg_wf, d)
+
+mvm_preds <- fitted_mvm %>% 
+  predict(test) %>% 
+  rename(profit = .pred) %>% 
+  bind_cols(test %>% dplyr::select(id)) %>% 
+  relocate(id, profit) %>% 
+  print()
+
+write_csv(mvm_preds, "mvm_preds.csv")
+
+```
+
+Awesome, we're on the board!! Now to make a model that actually predicts... anything
+
+```{r distributions of predictor variables}
+
+d %>% 
+  ggplot(aes(x = sales)) + 
+  geom_histogram()
+
+## FUNCTIONS ARE FOR SLICED
+
+num_vars <- d %>%
+  dplyr::select(where(is.numeric), -id) %>% 
+  names()
+
+map(num_vars, ~{
+  
+  d %>% 
+  ggplot(aes(x = .data[[.x]])) + 
+  geom_histogram()
+  
+})
+
+d_transformed <- xg_rec %>% 
+  prep(verbose = TRUE) %>% 
+  juice()
+
+num_vars_ii <- d_transformed %>%
+  dplyr::select(where(is.numeric), -id) %>% 
+  names()
+
+map(num_vars_ii, ~{
+  
+  d_transformed %>% 
+  ggplot(aes(x = .data[[.x]])) + 
+  geom_histogram()
+  
+})
+
+```
+
+Ok, based on all of this it might make sense to have discount be a factor variable as well. 
+Now that's done, I could just tune a workflowset and pray, but I don't think that will be enough. 
+*Thinking face emojii*
+
+Meg did let us know we can use outside data, so honestly I think one of my better bets my be trying to use the zipcodeR package to get some info about those zipcodes, get some features that way, and see if that helps me out at all
+
+Do I remember how to use that package? No, not really, let's see what happens!
+
+```{r}
+
+library(zipcodeR)
+
+zip_alone <- reverse_zipcode(d$postal_code) # OMG I just overwrote my test set and almost didn't notice
+glimpse(zip_alone)
+
+## Ok, looks like we have at least some features we can use here!
+
+zip_reduced <- zip_alone %>% 
+  dplyr::select(zipcode, radius_in_miles, population:median_household_income) %>% 
+  print()
+
+glimpse(zip_reduced)
+
+```
+```{r now lets add in the zipcode features through changing the dataframes}
+
+## Trying to think about how best to do this, and probably best to join back to the original dataframes by zipcode before putting stuff through the recipe
+
+d_zip <- d %>% 
+  left_join(zip_reduced, by = c("postal_code" = "zipcode")) %>% 
+  distinct(id, .keep_all = TRUE)
+
+# Trying to make sure I have the same number of rows, there we go! 
+
+glimpse(d)
+glimpse(d_zip)
+
+# Now have to do the same for the test set
+
+zip_alone_test <- reverse_zipcode(test$postal_code)
+glimpse(zip_alone_test)
+
+## Ok, looks like we have at least some features we can use here!
+
+zip_reduced_test <- zip_alone_test %>% 
+  dplyr::select(zipcode, radius_in_miles, population:median_household_income) %>% 
+  print()
+
+glimpse(zip_reduced_test)
+
+test_zip <- test %>% 
+  left_join(zip_reduced_test, by = c("postal_code" = "zipcode")) %>% 
+  distinct(id, .keep_all = TRUE)
+
+glimpse(test)
+glimpse(test_zip)
+
+```
+
+```{r now updating recipe with new zipcode features}
+
+## Recipe time! (Just kidding, R bomb time!! We'll use impute_median instead and hope that works)
+
+xg_rec_zip <- recipe(profit ~ ., data = d_zip) %>% 
+  update_role(id, new_role = "id") %>% 
+  step_rm(country) %>% 
+  step_novel(all_nominal_predictors()) %>% 
+  step_other(all_nominal_predictors()) %>% 
+  step_nzv(all_predictors()) %>% 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>% # Zip code might blow this up, we'll see
+  step_YeoJohnson(all_predictors()) %>% 
+  step_normalize(all_predictors()) %>% 
+  step_impute_median(all_predictors()) # We now have some missing data from the zipcode features
+
+## Testing to make sure this basic recipe doesn't blow up before i start even modeling
+
+library(tictoc) 
+tic()
+xg_rec_zip %>% 
+  prep(verbose = TRUE) %>% 
+  juice()
+toc()
+
+# Ok, that didn't blow up, let's see if we improved the basic model at all. Pretty soon I'm going to have to just start tuning a workflowset and praying
+
+```
+
+```{r putting together workflow with zip}
+
+xg_wf_zip <- workflow() %>% 
+  add_model(xg_mod) %>% 
+  add_recipe(xg_rec_zip)
+
+# Let's create the CV folds with ZIP data! (Wasn't working since I literally had it running on the wrong data)
+
+set.seed(33) ## Larry Bird is my Dad's favorite basketball player, hi Dad!
+store_folds_zip <- vfold_cv(d_zip, v = 10, repeats = 5)
+
+# Ok, let's run this as a job to keep the console free
+
+write_rds(xg_wf_zip, "xg_wf_zip.rds")
+write_rds(store_folds_zip, "store_folds_zip.rds")
+
+library(rstudioapi)
+
+jobRunScript("xg_zip_job.R", name = "xg_zip", exportEnv = "R_GlobalEnv")
+
+```
+
+I can't decide if this is good (jk, ok, since it's on the metric of $ and we know we have huge outliers) or terrible (because WOW that rmse looks large compared to previous weeks)
+
+```{r collecting cv metrics for basic model}
+
+xg_rs_zip %>% 
+  collect_metrics()
+
+```
+LOLOLOL this model is actually worse. Amazing! Ok, well, at least we tried, right team? Don't worry, not giving up yet, just probably not going to use those features since they seem to add more noise than anything
+
+I'm thinking if there's anything else I should try to do before I workflow_map this stuff...
+*Thinking time*
+
+Ok, this is a little silly, but how good is a linear model with just like, sales, discount, and... maybe nothing else?
+
+Ok ok, that is even super bad mega worse still, so we won't be submitting that one.
+
+```{r}
+
+skim(d)
+
+simple_rec <- recipe(profit ~ sales + quantity, data = d) %>% 
+  step_YeoJohnson(all_predictors())
+
+lm_mod <-
+  linear_reg() %>% 
+  set_engine("lm")
+
+lm_wf <- 
+  workflow() %>% 
+  add_model(lm_mod) %>% 
+  add_recipe(simple_rec)
+
+# Parallel time!
+
+registerDoMC(cores = 7)
+
+# Run CV
+
+lm_rs <- 
+  lm_wf %>% 
+  fit_resamples(store_folds, control = control_resamples(save_pred = TRUE))
+
+lm_rs %>% 
+  collect_metrics()
+
+```
+
+Alright, I better just workflowsets this before I run out of time to actually run it, make predictions, and do some more viz
+
+```{r}
+
+xg_mod_tune <- boost_tree(tree_depth = tune(), trees = tune(), learn_rate = tune(), min_n = tune()) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("regression")
+
+library(treesnip)
+library(lightgbm)
+
+lbgm_mod_tune <- boost_tree(tree_depth = tune(), trees = tune(), learn_rate = tune(), min_n = tune()) %>% 
+  set_engine("lightgbm") %>% 
+  set_mode("regression")
+
+sliced_set <- 
+  workflow_set(
+    preproc = list(rec = xg_rec),
+    models = list(xg = xg_mod_tune, lgbm = lbgm_mod_tune)
+  )
+
+write_rds(sliced_set, "sliced_set.rds")
+
+jobRunScript("wfsets_tune_job.R", name = "wfsets_tune", exportEnv = "R_GlobalEnv")
+
+
+```
+
+Ok, that seems to have not spectacularly crashed, so with some of the time I have while that model tunes in the background let's do some data viz
+
+Just kidding, first I'm going to write code that will set up making my predictions just in case this tuning absolutely runs me down to the wire
+
+```{r plotting workflowsets}
+
+autoplot(race) # I think this should plot which model looks better if both of them actually run (which I'm guessing will be highly relative)
+
+```
+
+So right now my CV is saying my workflowsets tuned models are both doing worse than a basic xgboost model with no tuning, which is very unfortunate. I'll probably still create predictions and submit, but right now I'll stick with my CV and my minimal model unless I can come up with something better in CV in the next 30 minutes
+
+```{r making predictions from workflowsets}
+
+rank_results(race)
+
+best_results_race <- race %>% 
+  pull_workflow_set_result("rec_xg") %>% # Need to fill this in later
+  show_best(metric = "rmse") %>% 
+  print()
+
+wfsets_fitted_mod <- race %>% 
+  pull_workflow("rec_xg") %>%  # Will need to add to this later
+  finalize_workflow(best_results_race) %>% 
+  fit(d)
+
+wfstes_preds <- wfsets_fitted_mod %>% 
+  predict(test) %>% 
+  rename(profit = .pred) %>% 
+  bind_cols(test %>% dplyr::select(id)) %>% 
+  relocate(id, profit) %>% 
+  print()
+
+write_csv(wfstes_preds, "wfsets_preds.csv")
+
+```
+
+Ok, now let's do some visualizations (Just kidding again, my models just finished running and/or failing)
+
+Might try doing a different workflowset of models? Or just see if I can visualize where the predictions are failing and then see if I can get a sense of how to correct that in the simpler model?
+
+```{r}
+
+wfsets_preds_viz <- wfsets_fitted_mod %>% 
+  predict(d) %>% 
+  bind_cols(d %>% dplyr::select(profit))
+
+## Ok, so the predictions are way off in the tails, which makes sense. I'm trying to think if there's anything relatively straightforward I can do about that with so little time remaining...
+
+wfsets_preds_viz %>% 
+  ggplot(aes(x = .pred, y = profit)) + 
+  geom_jitter() +
+  geom_smooth(method = "lm")
+
+```
+```{r}
+
+## Maybe if I can grab variable importance real quick I might be able to get rid of some irrelevant features which could help the basic xgboost model (Tree based models are influenced a bit more by irrelevant features)
+
+library(vip)
+
+wfsets_fitted_mod %>% # Need to fill this in later
+  vip() # Ahh, I didn't have these because I didn't set them in the basic model
+
+```
+
+Ok, the hyper-simple version of the xgboost model also doesn't have great performance, (especially compared to the minimal model) so we've gone both too simple and too complicated today! Honestly I'm going to be fascinated to figure out how to tackle this problem better in the future, since I know where the model is falling short but not 100% sure how to fix it within this time frame
+
+```{r}
+
+simple_rec <- recipe(profit ~ sales + quantity, data = d) %>% 
+  step_YeoJohnson(all_predictors())
+
+xg_wf_simple <- workflow() %>% 
+  add_model(xg_mod) %>% 
+  add_recipe(simple_rec)
+
+# Parallel time!
+
+registerDoMC(cores = 7)
+
+# Run CV
+
+xg_rs_simple <- 
+  xg_wf_simple %>% 
+  fit_resamples(store_folds, control = control_resamples(save_pred = TRUE))
+
+xg_rs_simple %>% 
+  collect_metrics()
+
+```
+Is there some ridiculously simple thing I'm missing that I might find last second by visualizing? Probably not, but let's ride!
+
+```{r}
+
+glimpse(d)
+
+```
+
+Based on these zoomed out histograms I briefly thought of trying to run a zero-inflated model, but then I remembered those values aren't actually zero. Also, shout out to Tony for running his first model in Excel last week, the theme is for him!
+
+```{r}
+d %>% 
+  ggplot(aes(x = profit, fill = segment)) + 
+  geom_histogram()
+
+library(ggthemes)
+
+d %>% 
+  ggplot(aes(x = profit, fill = region)) + 
+  geom_histogram() +
+  theme_excel()
+
+d %>% 
+  ggplot(aes(x = profit, fill = state)) + 
+  geom_histogram() +
+  theme_excel()
+
+```
+Alright y'all, what else can we do, other than a huge shout to everyone who's watching + supporting! (Seriously, y'all are awesome)
+
+I think we might have to try to make a quick map of the US where we get some profit viz going
+
+```{r}
+
+# First I have to remember how...
+
+library(usmap)
+
+d_profit <- d %>% 
+  dplyr::select(state, profit) %>% 
+  na.omit() %>% 
+  group_by(state) %>% 
+  mutate(sum_profit = sum(profit)) %>% 
+  ungroup() %>% 
+  distinct(state, .keep_all = TRUE) %>% 
+  dplyr::select(-profit) %>% 
+  print()
+
+plot_usmap(data = d_profit, values = "sum_profit", regions = "states") +
+  scale_fill_continuous(low = "white", high = "red", name = "Cumulative Profit in State", label = scales::comma) +
+  labs(title = "Wow the NY + CA Profits, Bet That Might Have Been Useful Earlier :P")
+
+```
+
+
